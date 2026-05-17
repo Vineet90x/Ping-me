@@ -31,6 +31,29 @@ class SalonRegister(BaseModel):
             raise ValueError('Invalid UPI format (e.g., name@bank)')
         return v
 
+class SalonUpdate(BaseModel):
+    owner_name: str = None
+    salon_name: str = None
+    upi_id: str = None
+    
+    @validator('owner_name')
+    def validate_owner_name(cls, v):
+        if v and len(v.strip()) < 2:
+            raise ValueError('Owner name must be at least 2 characters')
+        return v.strip() if v else None
+    
+    @validator('salon_name')
+    def validate_salon_name(cls, v):
+        if v and len(v.strip()) < 2:
+            raise ValueError('Salon name must be at least 2 characters')
+        return v.strip() if v else None
+    
+    @validator('upi_id')
+    def validate_upi(cls, v):
+        if v and not re.match(r'^[a-zA-Z0-9.\-_]+@[a-zA-Z]{3,}$', v):
+            raise ValueError('Invalid UPI format')
+        return v
+    
 class SalonResponse(BaseModel):
     id: str
     owner_phone: str

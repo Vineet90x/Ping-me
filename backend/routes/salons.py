@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from models.salon import SalonRegister, SalonResponse
+from models.salon import SalonRegister, SalonResponse, SalonUpdate
 from services.database import get_db
 
 router = APIRouter()
@@ -44,3 +44,27 @@ def get_salon_by_phone(owner_phone: str):
         raise HTTPException(status_code=404, detail="Salon not found")
     
     return response["data"][0]
+
+@router.patch("/{salon_id}")
+def update_salon(salon_id: str, salon: SalonUpdate):
+    db = get_db()
+    
+    salon_response = db.table("salons").eq("id", salon_id).execute()
+    if not salon_response["data"]:
+        raise HTTPException(status_code=404, detail="Salon not found")
+    
+    # Only update provided fields
+    update_data = {}
+    if salon.owner_name:
+        update_data["owner_name"] = salon.owner_name
+    if salon.salon_name:
+        update_data["salon_name"] = salon.salon_name
+    if salon.upi_id:
+        update_data["upi_id"] = salon.upi_id
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    
+    db.table("salons").eq("id", salon_id).update(update_data)
+    
+    return {"message": "Salon updated", "updated_fields": update_data}
