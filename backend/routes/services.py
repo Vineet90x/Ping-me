@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from models.services import ServiceCreate, ServiceResponse
+from models.service import ServiceCreate, ServiceResponse
 from services.database import get_db
 
 router = APIRouter()
@@ -31,7 +31,7 @@ def create_service(salon_id: str, service: ServiceCreate):
     
     return response["data"][0]
 
-@router.get("/{salon_id}/services")
+@router.get("/{salon_id}/services", response_model=list[ServiceResponse])
 def list_services(salon_id: str):
     db = get_db()
     

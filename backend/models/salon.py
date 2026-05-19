@@ -30,6 +30,14 @@ class SalonRegister(BaseModel):
         if v and not re.match(r'^[a-zA-Z0-9.\-_]+@[a-zA-Z]{3,}$', v):
             raise ValueError('Invalid UPI format (e.g., name@bank)')
         return v
+    
+    @validator('owner_name', 'salon_name')
+    def validate_names(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Field cannot be empty')
+        if len(v.strip()) < 2:
+            raise ValueError('Must be at least 2 characters')
+        return v.strip()    
 
 class SalonUpdate(BaseModel):
     owner_name: str = None

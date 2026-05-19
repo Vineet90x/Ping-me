@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes import salons, staff, services, appointments, invoices, broadcasts
+from routes import salons, staff, services, appointments, invoices, broadcasts, settings
 
 app = FastAPI(title="Ping Salon Booking API", version="0.1.0")
 
@@ -18,6 +18,7 @@ app.include_router(services.router, prefix="/api/salons", tags=["Services"])
 app.include_router(appointments.router, prefix="/api/salons", tags=["Appointments"])
 app.include_router(invoices.router, prefix="/api/salons", tags=["Invoices"])
 app.include_router(broadcasts.router, prefix="/api/salons", tags=["Broadcasts"])
+app.include_router(settings.router, prefix="/api/salons", tags=["Settings"])
 
 @app.get("/")
 def root():

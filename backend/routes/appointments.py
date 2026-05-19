@@ -18,6 +18,24 @@ def create_appointment(salon_id: str, appointment: AppointmentCreate):
     settings_response = db.table("settings").eq("salon_id", salon_id).execute()
     settings = settings_response["data"][0] if settings_response["data"] else None
     
+     # Get salon settings
+    settings_response = db.table("settings").eq("salon_id", salon_id).execute()
+    if settings_response["data"]:
+        settings = settings_response["data"][0]
+        opening_time = settings["opening_time"]
+        closing_time = settings["closing_time"]
+    else:
+        opening_time = "10:00"
+        closing_time = "20:00"
+    
+    # Validate appointment time is within business hours
+    appointment_time_str = str(appointment.appointment_time)
+    if appointment_time_str < opening_time or appointment_time_str >= closing_time:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Appointment must be between {opening_time} and {closing_time}"
+        )
+        
     # Check minimum advance booking time
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)

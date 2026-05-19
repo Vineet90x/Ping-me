@@ -7,7 +7,9 @@ class BroadcastCreate(BaseModel):
     
     @validator('message_text')
     def validate_message(cls, v):
-        if not v or len(v.strip()) < 5:
+        if not v or not v.strip():
+            raise ValueError('Message cannot be empty')
+        if len(v.strip()) < 5:
             raise ValueError('Message must be at least 5 characters')
         if len(v.strip()) > 500:
             raise ValueError('Message max 500 characters')
