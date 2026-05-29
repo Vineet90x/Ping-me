@@ -1,271 +1,381 @@
-from datetime import datetime
+"""WhatsApp webhook + conversational booking flow.
+
+Fixes the earlier hardcoded prototype:
+  * salons, services, staff are all fetched live and selected by the number the
+    customer actually types (no more "always book the first one");
+  * real calendar dates instead of a hardcoded date;
+  * time slots computed from business hours, service duration and existing
+    bookings (no double-booking);
+  * the customer's name is collected on first booking;
+  * owner STATS / TOMORROW / UNPAID return real data.
+"""
+import logging
+import re
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
 
-from services.database import get_db
+from config import now_ist
+from services import booking
+from services.booking import BookingError
+from services.database import DBError, get_db
+from services.messaging import send_whatsapp
 from services.session import Session
 
+logger = logging.getLogger("ping.webhook")
 router = APIRouter()
+
+RESTART_WORDS = {"HI", "HELLO", "HEY", "MENU", "BOOK", "START"}
+MAX_SALONS = 10
 
 
 @router.post("/whatsapp")
 async def whatsapp_webhook(request: Request):
-    """Receive WhatsApp messages from Twilio."""
+    """Receive WhatsApp messages from Twilio and reply."""
     try:
-        body = await request.form()
-        from_number = body.get("From")
-        message_body = body.get("Body")
+        form = await request.form()
+        from_number = form.get("From")
+        message_body = (form.get("Body") or "").strip()
 
         if not from_number or not message_body:
-            return {"status": "error"}
+            return {"status": "ignored"}
 
-        customer_phone = from_number.replace("whatsapp:", "").replace("+91", "").replace("+1", "")
-        response = route_message(customer_phone, message_body)
-        send_whatsapp_response(from_number, response)
+        phone = normalize_phone(from_number)
+        try:
+            response = route_message(phone, message_body)
+        except DBError as exc:
+            logger.error("DB error in webhook: %s", exc)
+            response = "Sorry, we're having a temporary issue. Please try again in a moment."
+        except Exception:
+            logger.exception("Unhandled error processing message")
+            response = "Something went wrong. Send *HI* to start over."
 
+        if response:
+            send_whatsapp(from_number, response)
         return {"status": "ok"}
-
-    except Exception as e:
-        print(f"ERROR: {e}")
-        import traceback
-
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Fatal webhook error")
         return {"status": "error"}
 
 
-def route_message(phone: str, message: str):
-    """Determine if the sender is an owner or a customer."""
+def normalize_phone(raw: str) -> str:
+    """`whatsapp:+919136275825` -> `9136275825` (last 10 digits)."""
+    digits = re.sub(r"\D", "", raw or "")
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def route_message(phone: str, message: str) -> str:
     db = get_db()
-    salon_response = db.table("salons").eq("owner_phone", phone).execute()
-
-    if salon_response["data"]:
-        return handle_owner_command(salon_response["data"][0], message)
-
-    return handle_customer_flow(phone, message)
+    salon = db.table("salons").eq("owner_phone", phone).execute()
+    if salon["data"]:
+        return handle_owner_command(salon["data"][0], message)
+    return handle_customer_flow(db, phone, message)
 
 
-def handle_owner_command(salon: dict, command: str):
-    """Handle owner commands."""
-    command = command.upper().strip()
+# --------------------------------------------------------------------------- #
+# Owner commands
+# --------------------------------------------------------------------------- #
+def handle_owner_command(salon: dict, command: str) -> str:
     db = get_db()
     salon_id = salon["id"]
+    cmd = command.upper().strip()
 
-    if command == "STATS":
-        appointments = db.table("appointments").eq("salon_id", salon_id).execute()
-        count = len([a for a in appointments["data"] if a["status"] == "confirmed"])
-        return f"Today's stats: {count} bookings"
+    if cmd == "STATS":
+        today = now_ist().date()
+        appts = (
+            db.table("appointments").eq("salon_id", salon_id).eq("appointment_date", str(today)).execute()["data"]
+        )
+        confirmed = sum(1 for a in appts if a["status"] == "confirmed")
+        completed = sum(1 for a in appts if a["status"] == "completed")
+        cancelled = sum(1 for a in appts if a["status"] in ("cancelled", "no_show"))
+        return (
+            f"📊 Today ({today.strftime('%d %b')})\n"
+            f"Upcoming: {confirmed}\nCompleted: {completed}\nCancelled/No-show: {cancelled}"
+        )
 
-    if command == "TOMORROW":
-        return "Tomorrow: 3 appointments at 10am, 2pm, 4pm"
+    if cmd == "TOMORROW":
+        tomorrow = (now_ist() + timedelta(days=1)).date()
+        appts = (
+            db.table("appointments")
+            .eq("salon_id", salon_id)
+            .eq("appointment_date", str(tomorrow))
+            .order("appointment_time")
+            .execute()["data"]
+        )
+        active = [a for a in appts if a["status"] == "confirmed"]
+        if not active:
+            return f"No appointments tomorrow ({tomorrow.strftime('%d %b')}). Enjoy the break!"
+        services = _id_map(db, salon_id, "services", "service_name")
+        staff = _id_map(db, salon_id, "staff", "staff_name")
+        customers = _id_map(db, salon_id, "customers", "customer_name")
+        lines = [f"📅 Tomorrow ({tomorrow.strftime('%a %d %b')}): {len(active)} booking(s)"]
+        for a in active:
+            lines.append(
+                f"• {_fmt_time(a['appointment_time'])} — "
+                f"{services.get(a['service_id'], 'Service')} with "
+                f"{staff.get(a['staff_id'], 'staff')} "
+                f"({customers.get(a['customer_id'], 'Customer')})"
+            )
+        return "\n".join(lines)
 
-    if command == "UNPAID":
-        invoices = db.table("invoices").eq("salon_id", salon_id).execute()
-        unpaid = [inv for inv in invoices["data"] if inv["payment_status"] == "unpaid"]
-        total = sum(inv["amount"] for inv in unpaid)
-        return f"Unpaid invoices: {len(unpaid)} customers, ₹{total/100}"
+    if cmd == "UNPAID":
+        invoices = (
+            db.table("invoices").eq("salon_id", salon_id).eq("payment_status", "unpaid").execute()["data"]
+        )
+        total = sum(inv["amount"] for inv in invoices)
+        return f"💰 Unpaid: {len(invoices)} invoice(s), ₹{total / 100:,.2f} outstanding"
 
-    return "Commands: STATS, TOMORROW, UNPAID"
+    return "Commands:\n• *STATS* — today's bookings\n• *TOMORROW* — tomorrow's schedule\n• *UNPAID* — outstanding invoices"
 
 
-def handle_customer_flow(phone: str, message: str):
-    """Handle multi-step customer booking flow."""
-    db = get_db()
+def _id_map(db, salon_id: str, table: str, name_field: str) -> dict:
+    rows = db.table(table).eq("salon_id", salon_id).execute()["data"]
+    return {r["id"]: r.get(name_field) for r in rows}
+
+
+# --------------------------------------------------------------------------- #
+# Customer booking flow
+# --------------------------------------------------------------------------- #
+def handle_customer_flow(db, phone: str, message: str) -> str:
     session = Session(phone)
     state = session.get()
+    text = message.strip()
+    upper = text.upper()
 
-    if not state:
-        session.set(
-            {
-                "step": "start",
-                "phone": phone,
-                "created_at": datetime.now().isoformat(),
-            }
-        )
-        return show_salons_menu()
+    if upper == "CANCEL":
+        session.delete()
+        return "No problem — booking cancelled. Send *HI* anytime to start again."
+
+    if not state or upper in RESTART_WORDS:
+        return _start(db, session, phone)
 
     step = state.get("step")
-
-    if step == "start":
-        if message.strip() == "1":
-            session.update(
-                {
-                    "step": "salon_selected",
-                    "salon_id": "dd4ccd26-3d0d-4c27-8f69-89b5928581b8",
-                }
-            )
-            return show_services_menu("dd4ccd26-3d0d-4c27-8f69-89b5928581b8")
-        return "Reply with 1"
-
-    if step == "salon_selected":
-        salon_id = state.get("salon_id")
-        if message.strip() == "1":
-            services = db.table("services").eq("salon_id", salon_id).execute()
-            if services["data"]:
-                service_id = services["data"][0]["id"]
-                session.update(
-                    {"step": "service_selected", "service_id": service_id}
-                )
-                return show_services_menu(salon_id)
-            return "No services available"
-        return "Reply with 1"
-
-    if step == "service_selected":
-        salon_id = state.get("salon_id")
-        if message.strip() == "1":
-            staff = db.table("staff").eq("salon_id", salon_id).execute()
-            if staff["data"]:
-                staff_id = staff["data"][0]["id"]
-                session.update(
-                    {"step": "staff_selected", "staff_id": staff_id}
-                )
-                return show_staff_menu(salon_id)
-            return "No staff available"
-        return "Reply with 1"
-
-    if step == "staff_selected":
-        if message.strip() in ["1", "2", "3", "4"]:
-            times = ["14:00", "15:00", "16:00", "17:00"]
-            time_idx = int(message.strip()) - 1
-            selected_time = times[time_idx]
-            session.update(
-                {"step": "time_selected", "appointment_time": selected_time}
-            )
-            return confirm_booking(session.get())
-        return "Reply with 1-4"
-
-    if step == "time_selected":
-        if message.upper().strip() == "CONFIRM":
-            booking_data = session.get()
-            create_appointment(db, phone, booking_data)
-            session.delete()
-            return "✓ Appointment confirmed!"
-        return "Reply CONFIRM to book"
-
-    return "Invalid state"
-
-def show_salons_menu():
-    return """Welcome to Ping!
-
-Choose a salon:
-1. Neha's Beauty Salon
-
-Reply with number"""
+    handlers = {
+        "choose_salon": _step_salon,
+        "choose_service": _step_service,
+        "choose_staff": _step_staff,
+        "choose_date": _step_date,
+        "choose_time": _step_time,
+        "ask_name": _step_name,
+        "confirm": _step_confirm,
+    }
+    handler = handlers.get(step)
+    if not handler:
+        session.delete()
+        return _start(db, session, phone)
+    return handler(db, session, state, phone, text)
 
 
-def show_services_menu(salon_id: str):
-    db = get_db()
-    services = db.table("services").eq("salon_id", salon_id).execute()
-
-    if not services["data"]:
-        return "No services available"
-
-    menu = "Choose a service:\n"
-    for i, service in enumerate(services["data"], 1):
-        price = service["price"] / 100
-        menu += f"{i}. {service['service_name']} - ₹{price}\n"
-    menu += "\nReply with number"
-    return menu
+def _pick(text: str, options: list) -> int | None:
+    """Return the 0-based index a customer selected, or None if invalid."""
+    if not text.isdigit():
+        return None
+    idx = int(text) - 1
+    return idx if 0 <= idx < len(options) else None
 
 
-def show_staff_menu(salon_id: str):
-    db = get_db()
-    staff = db.table("staff").eq("salon_id", salon_id).execute()
+def _start(db, session: Session, phone: str) -> str:
+    salons = db.table("salons").order("salon_name").limit(MAX_SALONS).execute()["data"]
+    if not salons:
+        return "No salons are available right now. Please try again later."
 
-    if not staff["data"]:
-        return "No staff available"
+    if len(salons) == 1:
+        salon = salons[0]
+        session.set({"step": "choose_service", "phone": phone, "salon_id": salon["id"], "salon_name": salon["salon_name"]})
+        return f"Welcome to *{salon['salon_name']}*! 💇\n\n" + _services_menu(db, session, salon["id"])
 
-    menu = "Choose a stylist:\n"
-    for i, s in enumerate(staff["data"], 1):
-        menu += f"{i}. {s['staff_name']}\n"
-    menu += "\nReply with number"
-    return menu
-
-
-def show_time_menu():
-    times = ["2:00 PM", "3:00 PM", "4:00 PM", "5:00 PM"]
-    menu = "Choose a time:\n"
-    for i, time in enumerate(times, 1):
-        menu += f"{i}. {time}\n"
-    menu += "\nReply with number"
-    return menu
+    ids = [s["id"] for s in salons]
+    names = [s["salon_name"] for s in salons]
+    session.set({"step": "choose_salon", "phone": phone, "options": ids, "names": names})
+    menu = "Welcome to *Ping*! 💇\n\nChoose a salon:\n"
+    menu += "\n".join(f"{i}. {n}" for i, n in enumerate(names, 1))
+    return menu + "\n\nReply with the number."
 
 
-def confirm_booking(booking_data: dict):
-    db = get_db()
-    salon_id = booking_data.get("salon_id")
-    service_id = booking_data.get("service_id")
-    staff_id = booking_data.get("staff_id")
-    appointment_time = booking_data.get("appointment_time")
-    
-    # Get service name
-    service = db.table("services").eq("id", service_id).execute()
-    service_name = service["data"][0]["service_name"] if service["data"] else "Unknown"
-    
-    # Get staff name
-    staff = db.table("staff").eq("id", staff_id).execute()
-    staff_name = staff["data"][0]["staff_name"] if staff["data"] else "Unknown"
-    
-    return f"""Confirm your booking?
-
-Service: {service_name}
-Stylist: {staff_name}
-Time: {appointment_time}
-
-Reply CONFIRM"""
+def _step_salon(db, session, state, phone, text) -> str:
+    idx = _pick(text, state.get("options", []))
+    if idx is None:
+        return "Please reply with the number of a salon from the list."
+    salon_id = state["options"][idx]
+    salon_name = state["names"][idx]
+    session.update({"step": "choose_service", "salon_id": salon_id, "salon_name": salon_name})
+    return _services_menu(db, session, salon_id)
 
 
-def create_appointment(db, phone: str, booking_data: dict):
-    """Create appointment in database."""
-    salon_id = booking_data.get("salon_id")
-
-    customer_response = db.table("customers").eq("salon_id", salon_id).execute()
-    customer_id = None
-
-    for cust in customer_response["data"]:
-        if cust["phone"] == phone:
-            customer_id = cust["id"]
-            break
-
-    if not customer_id:
-        cust_response = db.table("customers").insert(
-            {
-                "salon_id": salon_id,
-                "phone": phone,
-                "customer_name": "Customer",
-                "opted_out_broadcasts": False,
-            }
-        )
-        customer_id = cust_response["data"][0]["id"]
-
-    db.table("appointments").insert(
+def _services_menu(db, session, salon_id) -> str:
+    services = booking.get_active_services(db, salon_id)
+    if not services:
+        session.delete()
+        return "This salon has no services listed yet. Please try again later."
+    session.update(
         {
-            "salon_id": salon_id,
-            "customer_id": customer_id,
-            "staff_id": booking_data.get("staff_id"),
-            "service_id": booking_data.get("service_id"),
-            "appointment_date": "2026-05-20",
-            "appointment_time": booking_data.get("appointment_time"),
-            "status": "confirmed",
+            "service_options": [s["id"] for s in services],
+            "service_meta": {s["id"]: {"name": s["service_name"], "price": s["price"], "duration": s["duration_minutes"]} for s in services},
         }
+    )
+    menu = "Choose a service:\n"
+    for i, s in enumerate(services, 1):
+        menu += f"{i}. {s['service_name']} — ₹{s['price'] / 100:,.0f} ({s['duration_minutes']} min)\n"
+    return menu + "\nReply with the number."
+
+
+def _step_service(db, session, state, phone, text) -> str:
+    options = state.get("service_options", [])
+    idx = _pick(text, options)
+    if idx is None:
+        return "Please reply with the number of a service from the list."
+    service_id = options[idx]
+    session.update({"step": "choose_staff", "service_id": service_id})
+    return _staff_menu(db, session, state["salon_id"])
+
+
+def _staff_menu(db, session, salon_id) -> str:
+    staff = booking.get_active_staff(db, salon_id)
+    if not staff:
+        session.delete()
+        return "This salon has no stylists available yet. Please try again later."
+    session.update(
+        {
+            "staff_options": [s["id"] for s in staff],
+            "staff_names": {s["id"]: s["staff_name"] for s in staff},
+        }
+    )
+    menu = "Choose a stylist:\n"
+    for i, s in enumerate(staff, 1):
+        menu += f"{i}. {s['staff_name']}\n"
+    return menu + "\nReply with the number."
+
+
+def _step_staff(db, session, state, phone, text) -> str:
+    options = state.get("staff_options", [])
+    idx = _pick(text, options)
+    if idx is None:
+        return "Please reply with the number of a stylist from the list."
+    staff_id = options[idx]
+    session.update({"step": "choose_date", "staff_id": staff_id})
+    return _date_menu(db, session, state["salon_id"])
+
+
+def _date_menu(db, session, salon_id) -> str:
+    settings = booking.get_settings(db, salon_id)
+    days = min(int(settings["days_advance_booking"]), 7)
+    today = now_ist().date()
+    dates = [today + timedelta(days=i) for i in range(days)]
+    session.update({"date_options": [str(d) for d in dates], "_settings": settings})
+    menu = "Choose a day:\n"
+    for i, d in enumerate(dates, 1):
+        label = "Today" if i == 1 else ("Tomorrow" if i == 2 else d.strftime("%a"))
+        menu += f"{i}. {label}, {d.strftime('%d %b')}\n"
+    return menu + "\nReply with the number."
+
+
+def _step_date(db, session, state, phone, text) -> str:
+    options = state.get("date_options", [])
+    idx = _pick(text, options)
+    if idx is None:
+        return "Please reply with the number of a day from the list."
+    appt_date = booking.parse_date(options[idx])
+    meta = state["service_meta"][state["service_id"]]
+    settings = state.get("_settings") or booking.get_settings(db, state["salon_id"])
+    slots = booking.available_slots(
+        db, state["salon_id"], state["staff_id"], appt_date, meta["duration"], settings
+    )
+    if not slots:
+        return "No free slots that day 😕. Please reply with another day's number."
+
+    slot_strs = [s.strftime("%H:%M") for s in slots]
+    session.update({"step": "choose_time", "appt_date": options[idx], "time_options": slot_strs})
+    menu = f"Available times on {appt_date.strftime('%a %d %b')}:\n"
+    for i, t in enumerate(slot_strs, 1):
+        menu += f"{i}. {_fmt_time(t)}\n"
+    return menu + "\nReply with the number."
+
+
+def _step_time(db, session, state, phone, text) -> str:
+    options = state.get("time_options", [])
+    idx = _pick(text, options)
+    if idx is None:
+        return "Please reply with the number of a time from the list."
+    appt_time = options[idx]
+
+    # Skip asking for a name if we already know this customer.
+    existing = db.table("customers").eq("salon_id", state["salon_id"]).eq("phone", phone).execute()["data"]
+    known_name = existing[0]["customer_name"] if existing else None
+    if known_name and known_name.strip().lower() != "customer":
+        session.update({"step": "confirm", "appt_time": appt_time, "customer_name": known_name})
+        return _confirm_summary(state, appt_time, known_name)
+
+    session.update({"step": "ask_name", "appt_time": appt_time})
+    return "Almost done! What's your name?"
+
+
+def _step_name(db, session, state, phone, text) -> str:
+    name = text.strip()
+    if len(name) < 2:
+        return "Please send your name (at least 2 letters)."
+    session.update({"step": "confirm", "customer_name": name})
+    return _confirm_summary(state, state["appt_time"], name)
+
+
+def _confirm_summary(state, appt_time, name) -> str:
+    meta = state["service_meta"][state["service_id"]]
+    staff_name = state["staff_names"][state["staff_id"]]
+    appt_date = booking.parse_date(state["appt_date"])
+    return (
+        f"Please confirm your booking, {name}:\n\n"
+        f"💇 Service: {meta['name']} (₹{meta['price'] / 100:,.0f})\n"
+        f"✂️ Stylist: {staff_name}\n"
+        f"📅 Date: {appt_date.strftime('%a %d %b %Y')}\n"
+        f"🕐 Time: {_fmt_time(appt_time)}\n\n"
+        f"Reply *CONFIRM* to book, or *CANCEL* to stop."
     )
 
 
-def send_whatsapp_response(to_number: str, message: str):
-    """Send WhatsApp message via Twilio."""
-    from twilio.rest import Client
-    import os
+def _step_confirm(db, session, state, phone, text) -> str:
+    if text.upper().strip() != "CONFIRM":
+        return "Reply *CONFIRM* to book, or *CANCEL* to stop."
 
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    twilio_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
-
-    client = Client(account_sid, auth_token)
+    salon_id = state["salon_id"]
+    meta = state["service_meta"][state["service_id"]]
+    service = {"id": state["service_id"], "duration_minutes": meta["duration"]}
+    appt_date = booking.parse_date(state["appt_date"])
+    appt_time = booking.parse_time(state["appt_time"])
+    name = state.get("customer_name", "Customer")
 
     try:
-        client.messages.create(
-            body=message,
-            from_=twilio_number,
-            to=to_number,
+        customer = booking.get_or_create_customer(db, salon_id, phone, name)
+        if customer.get("customer_name", "").strip().lower() == "customer" and name != "Customer":
+            db.table("customers").eq("id", customer["id"]).update({"customer_name": name})
+        booking.create_appointment(
+            db,
+            salon_id=salon_id,
+            customer_id=customer["id"],
+            staff_id=state["staff_id"],
+            service=service,
+            appt_date=appt_date,
+            appt_time=appt_time,
         )
-    except Exception as e:
-        print(f"Error sending: {e}")
+    except BookingError as exc:
+        # Let them retry the time without losing the rest of the booking.
+        session.update({"step": "choose_date"})
+        return f"⚠️ {exc}\n\n" + _date_menu(db, session, salon_id)
+
+    session.delete()
+    staff_name = state["staff_names"][state["staff_id"]]
+    return (
+        f"✅ Booking confirmed, {name}!\n\n"
+        f"{meta['name']} with {staff_name}\n"
+        f"{appt_date.strftime('%a %d %b')} at {_fmt_time(state['appt_time'])}\n\n"
+        f"See you soon! Send *HI* to book again."
+    )
+
+
+def _fmt_time(value) -> str:
+    """`"14:00"` / `"14:00:00"` -> `"2:00 PM"`."""
+    text = str(value)
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%I:%M %p").lstrip("0")
+        except ValueError:
+            continue
+    return text

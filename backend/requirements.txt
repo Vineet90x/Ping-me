@@ -1,10 +1,12 @@
 fastapi==0.104.1
 uvicorn==0.24.0
 python-dotenv==1.0.0
+pydantic>=2.0,<3.0
 redis==5.0.1
 httpx==0.24.1
 twilio==8.10.0
 python-multipart==0.0.6
 reportlab==4.0.9
+pillow==12.2.0
 celery==5.3.4
-supabase==2.4.0
+pytest==8.3.4
