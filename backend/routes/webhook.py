@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
 
-from config import now_ist
+from config import DEBUG, now_ist
 from services import booking
 from services.booking import BookingError
 from services.database import DBError, get_db
@@ -46,9 +46,13 @@ async def whatsapp_webhook(request: Request):
         except DBError as exc:
             logger.error("DB error in webhook: %s", exc)
             response = "Sorry, we're having a temporary issue. Please try again in a moment."
-        except Exception:
+        except Exception as exc:
             logger.exception("Unhandled error processing message")
-            response = "Something went wrong. Send *HI* to start over."
+            response = (
+                f"Something went wrong ({type(exc).__name__}: {exc}). Send *HI* to start over."
+                if DEBUG
+                else "Something went wrong. Send *HI* to start over."
+            )
 
         if response:
             send_whatsapp(from_number, response)
@@ -344,7 +348,7 @@ def _step_confirm(db, session, state, phone, text) -> str:
 
     try:
         customer = booking.get_or_create_customer(db, salon_id, phone, name)
-        if customer.get("customer_name", "").strip().lower() == "customer" and name != "Customer":
+        if (customer.get("customer_name") or "").strip().lower() == "customer" and name != "Customer":
             db.table("customers").eq("id", customer["id"]).update({"customer_name": name})
         booking.create_appointment(
             db,

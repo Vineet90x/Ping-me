@@ -41,7 +41,10 @@ def parse_date(value) -> date:
         return value
     if isinstance(value, datetime):
         return value.date()
-    return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise BookingError(f"Invalid date: {value!r}") from exc
 
 
 def get_settings(db: DB, salon_id: str) -> dict:

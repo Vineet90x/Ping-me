@@ -106,8 +106,9 @@ class Table:
 
     # --- execution --------------------------------------------------------
     def _request(self, method: str, **kwargs) -> httpx.Response:
+        headers = kwargs.pop("headers", self.headers)
         try:
-            resp = _client.request(method, self.url, headers=self.headers, **kwargs)
+            resp = _client.request(method, self.url, headers=headers, **kwargs)
         except httpx.HTTPError as exc:
             logger.error("DB %s %s failed: %s", method, self.name, exc)
             raise DBError(f"Database unreachable: {exc}") from exc
