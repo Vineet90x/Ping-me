@@ -137,6 +137,20 @@ class Table:
         resp = self._request("POST", json=payload, headers=headers)
         return {"data": resp.json()}
 
+    def upsert(self, data, on_conflict: str, ignore_duplicates: bool = False) -> dict:
+        """Insert rows, resolving conflicts on the ``on_conflict`` column(s).
+
+        With ``ignore_duplicates=True`` a conflicting row is left untouched and
+        is NOT returned (so an empty ``data`` means "it already existed"); with
+        the default merge behaviour the conflicting row is updated.
+        """
+        resolution = "ignore-duplicates" if ignore_duplicates else "merge-duplicates"
+        headers = {**self.headers, "Prefer": f"return=representation,resolution={resolution}"}
+        params = {"on_conflict": on_conflict}
+        payload = data if isinstance(data, list) else [data]
+        resp = self._request("POST", json=payload, headers=headers, params=params)
+        return {"data": resp.json() if resp.text else []}
+
     def update(self, data: dict) -> dict:
         if not self.params:
             # Guard rail: an unfiltered PATCH would rewrite the whole table.

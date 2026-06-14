@@ -29,7 +29,7 @@ def _to_whatsapp(number: str) -> str:
 def send_whatsapp(to_number: str, body: str, media_url: str | None = None) -> bool:
     """Send a WhatsApp message. Returns True on success, False otherwise."""
     if not _client or not TWILIO_WHATSAPP_NUMBER:
-        logger.info("[whatsapp skipped] to=%s body=%s", to_number, body[:80])
+        logger.debug("[whatsapp skipped] to=%s body=%s", to_number, body[:80])
         return False
     try:
         kwargs = {
@@ -40,6 +40,7 @@ def send_whatsapp(to_number: str, body: str, media_url: str | None = None) -> bo
         if media_url:
             kwargs["media_url"] = [media_url]
         _client.messages.create(**kwargs)
+        logger.debug("Sent WhatsApp to %s", to_number)
         return True
     except Exception as exc:
         logger.error("Failed to send WhatsApp to %s: %s", to_number, exc)

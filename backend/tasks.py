@@ -94,6 +94,47 @@ def send_due_reminders() -> dict:
     return {"sent_24h": sent_24h, "sent_1h": sent_1h}
 
 
+@celery_app.task(name="tasks.notify_unpaid_invoices")
+def notify_unpaid_invoices() -> dict:
+    """Daily nudge: DM each owner a summary of invoices unpaid for >24h.
+
+    Closes the loop on the manual-payment model — a faked or forgotten payment
+    can't silently sit unpaid because the owner gets a standing reminder.
+    """
+    db = get_db()
+    cutoff = now_ist() - timedelta(hours=24)
+    notified = 0
+
+    for salon in db.table("salons").execute()["data"]:
+        unpaid = (
+            db.table("invoices").eq("salon_id", salon["id"]).eq("payment_status", "unpaid").execute()["data"]
+        )
+        overdue = []
+        for inv in unpaid:
+            created = inv.get("created_at")
+            if not created:
+                continue
+            try:
+                created_dt = datetime.fromisoformat(str(created).replace("Z", "").split("+")[0])
+            except ValueError:
+                continue
+            if created_dt <= cutoff:
+                overdue.append(inv)
+
+        if not overdue or not salon.get("owner_phone"):
+            continue
+        total = sum(i["amount"] for i in overdue)
+        send_whatsapp(
+            f"+91{salon['owner_phone']}",
+            f"🧾 Reminder: {len(overdue)} invoice(s) unpaid for over a day — "
+            f"₹{total / 100:,.0f} outstanding. Send *UNPAID* to see them.",
+        )
+        notified += 1
+
+    logger.info("Unpaid-invoice nudges sent to %s owner(s)", notified)
+    return {"notified": notified}
+
+
 @celery_app.task(name="tasks.send_broadcast")
 def send_broadcast(broadcast_id: str, salon_id: str) -> dict:
     """Deliver a broadcast to all opted-in customers of a salon."""

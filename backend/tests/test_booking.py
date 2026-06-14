@@ -92,3 +92,20 @@ def test_get_or_create_customer_is_idempotent():
     c2 = booking.get_or_create_customer(db, SALON, "9999999999", "Asha")
     assert c1["id"] == c2["id"]
     assert len(db.store["customers"]) == 1
+
+
+def test_get_or_create_customer_preserves_existing_name():
+    db = _seed()
+    booking.get_or_create_customer(db, SALON, "9999999999", "Asha")
+    # A later call with the default name must not overwrite the real one.
+    c = booking.get_or_create_customer(db, SALON, "9999999999", "Customer")
+    assert c["customer_name"] == "Asha"
+    assert len(db.store["customers"]) == 1
+
+
+def test_get_or_create_customer_unique_per_salon():
+    db = _seed()
+    a = booking.get_or_create_customer(db, SALON, "9999999999", "Asha")
+    b = booking.get_or_create_customer(db, "salon-2", "9999999999", "Asha")
+    assert a["id"] != b["id"]  # same phone, different salon -> distinct rows
+    assert len(db.store["customers"]) == 2

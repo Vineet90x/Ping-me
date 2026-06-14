@@ -7,22 +7,22 @@ import logging
 
 import httpx
 
-from config import SUPABASE_KEY, SUPABASE_URL
+from config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 
 logger = logging.getLogger("ping.storage")
 
 
 def upload_bytes(bucket: str, path: str, data: bytes, content_type: str) -> str | None:
     """Upload ``data`` to ``bucket/path`` and return its public URL, or None."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.info("Storage not configured; skipping upload of %s/%s", bucket, path)
         return None
 
     base = SUPABASE_URL.rstrip("/")
     url = f"{base}/storage/v1/object/{bucket}/{path}"
     headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": content_type,
         "x-upsert": "true",
     }

@@ -2,21 +2,14 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from config import SUPABASE_INVOICE_BUCKET
+from config import now_ist
 from models.invoice import InvoiceCreate, InvoiceResponse
-from services import storage
+from services import invoicing
 from services.database import get_db
-from services.pdf import generate_invoice_pdf
+from services.invoicing import InvoiceError
 
 logger = logging.getLogger("ping.invoices")
 router = APIRouter()
-
-
-def _upi_link(upi_id: str | None, amount_paise: int, invoice_id: str) -> str | None:
-    if not upi_id:
-        return None
-    amount_rupees = round(amount_paise / 100, 2)
-    return f"upi://pay?pa={upi_id}&pn=Ping&am={amount_rupees}&tr=INV-{str(invoice_id)[:8]}"
 
 
 @router.post("/{salon_id}/invoices", response_model=InvoiceResponse)
@@ -28,41 +21,19 @@ def create_invoice(salon_id: str, invoice: InvoiceCreate):
         raise HTTPException(status_code=404, detail="Salon not found")
     salon = salon_response["data"][0]
 
-    customer_response = (
-        db.table("customers").eq("id", invoice.customer_id).eq("salon_id", salon_id).execute()
-    )
-    if not customer_response["data"]:
-        raise HTTPException(status_code=404, detail="Customer not found")
-
-    if invoice.appointment_id:
-        appt = (
-            db.table("appointments")
-            .eq("id", invoice.appointment_id)
-            .eq("salon_id", salon_id)
-            .execute()
+    try:
+        created = invoicing.create_invoice(
+            db,
+            salon_id=salon_id,
+            customer_id=invoice.customer_id,
+            amount=invoice.amount,
+            description=invoice.description,
+            appointment_id=invoice.appointment_id,
         )
-        if not appt["data"]:
-            raise HTTPException(status_code=404, detail="Appointment not found")
+    except InvoiceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
-    record = {
-        "salon_id": salon_id,
-        "customer_id": invoice.customer_id,
-        "amount": invoice.amount,
-        "description": invoice.description,
-        "payment_status": "unpaid",
-    }
-    if invoice.appointment_id:
-        record["appointment_id"] = invoice.appointment_id
-
-    response = db.table("invoices").insert(record)
-    if not response["data"]:
-        raise HTTPException(status_code=400, detail="Insert failed")
-
-    invoice_data = response["data"][0]
-    return {
-        **invoice_data,
-        "upi_link": _upi_link(salon.get("upi_id"), invoice.amount, invoice_data["id"]),
-    }
+    return {**created, **invoicing.links(salon, created)}
 
 
 @router.get("/{salon_id}/invoices")
@@ -90,8 +61,6 @@ def update_invoice_status(salon_id: str, invoice_id: str, payment_status: str):
     if not response["data"]:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    from config import now_ist
-
     update_data = {"payment_status": payment_status}
     update_data["paid_at"] = now_ist().isoformat() if payment_status == "paid" else None
 
@@ -117,17 +86,11 @@ def generate_invoice_pdf_endpoint(salon_id: str, invoice_id: str):
     customer_resp = db.table("customers").eq("id", invoice["customer_id"]).execute()
     customer = customer_resp["data"][0] if customer_resp["data"] else {}
 
-    pdf_bytes = generate_invoice_pdf(invoice, salon, customer)
-    path = f"{salon_id}/INV-{str(invoice_id)[:8]}.pdf"
-    public_url = storage.upload_bytes(
-        SUPABASE_INVOICE_BUCKET, path, pdf_bytes, "application/pdf"
-    )
-
+    public_url = invoicing.generate_and_store_pdf(db, salon, invoice, customer)
     if not public_url:
         raise HTTPException(
             status_code=502,
             detail="PDF generated but upload failed. Check the storage bucket exists.",
         )
 
-    db.table("invoices").eq("id", invoice_id).update({"pdf_url": public_url})
     return {"message": "Invoice PDF generated", "pdf_url": public_url}

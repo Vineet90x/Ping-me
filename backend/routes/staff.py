@@ -1,9 +1,34 @@
+from typing import Optional
+import re
+
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, field_validator
 
 from models.staff import StaffCreate, StaffResponse
 from services.database import get_db
 
 router = APIRouter()
+
+PHONE_RE = re.compile(r"^\d{10}$")
+
+
+class StaffUpdate(BaseModel):
+    staff_name: Optional[str] = None
+    phone: Optional[str] = None
+
+    @field_validator("staff_name")
+    @classmethod
+    def validate_name(cls, v):
+        if v is not None and len(v.strip()) < 2:
+            raise ValueError("Staff name must be at least 2 characters")
+        return v.strip() if v else v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        if v and not PHONE_RE.match(v):
+            raise ValueError("Phone must be 10 digits")
+        return v
 
 
 def _require_salon(db, salon_id: str):
@@ -44,6 +69,23 @@ def list_staff(salon_id: str, include_inactive: bool = False):
     if not include_inactive:
         query = query.eq("is_active", "true")
     return query.order("staff_name").execute()["data"]
+
+
+@router.patch("/{salon_id}/staff/{staff_id}", response_model=StaffResponse)
+def update_staff(salon_id: str, staff_id: str, data: StaffUpdate):
+    db = get_db()
+    staff_response = db.table("staff").eq("id", staff_id).eq("salon_id", salon_id).execute()
+    if not staff_response["data"]:
+        raise HTTPException(status_code=404, detail="Staff not found")
+
+    updates = {k: v for k, v in data.model_dump().items() if v is not None}
+    if not updates:
+        return staff_response["data"][0]
+
+    result = db.table("staff").eq("id", staff_id).update(updates)
+    if not result["data"]:
+        raise HTTPException(status_code=400, detail="Update failed")
+    return result["data"][0]
 
 
 @router.delete("/{salon_id}/staff/{staff_id}")

@@ -60,7 +60,22 @@ def get_settings(db: DB, salon_id: str) -> dict:
             if row.get("min_advance_booking_minutes") is not None
             else DEFAULT_MIN_ADVANCE_MINUTES
         ),
+        # Physical capacity (chairs). None -> "no extra limit beyond staff count".
+        "max_concurrent": row.get("max_concurrent"),
     }
+
+
+def get_max_concurrent(settings: dict, staff_count: int) -> int:
+    """Effective simultaneous-appointment cap (the salon's chairs).
+
+    If unset, the cap is just the number of stylists (each works one client).
+    A salon with more stylists than chairs sets ``max_concurrent`` to the
+    chair count to stop overbooking the room.
+    """
+    value = settings.get("max_concurrent")
+    if not value or value <= 0:
+        return max(staff_count, 1)
+    return value
 
 
 def get_active_services(db: DB, salon_id: str) -> list[dict]:
@@ -108,6 +123,89 @@ def has_conflict(db: DB, salon_id: str, staff_id: str, appt_date: date, appt_tim
     return _overlaps(start, end, _busy_intervals(db, salon_id, staff_id, appt_date))
 
 
+def _salon_intervals(db: DB, salon_id: str, appt_date: date) -> list[tuple]:
+    """Every active appointment for the salon that day, as (staff_id, start, end)."""
+    resp = (
+        db.table("appointments")
+        .eq("salon_id", salon_id)
+        .eq("appointment_date", str(appt_date))
+        .execute()
+    )
+    durations = _service_duration_map(db, salon_id)
+    out = []
+    for apt in resp["data"]:
+        if apt.get("status") not in ACTIVE_STATUSES:
+            continue
+        start = datetime.combine(parse_date(apt["appointment_date"]), parse_time(apt["appointment_time"]))
+        dur = durations.get(apt.get("service_id"), SLOT_STEP_MINUTES)
+        out.append((apt.get("staff_id"), start, start + timedelta(minutes=dur)))
+    return out
+
+
+def _concurrent(intervals: list[tuple], start: datetime, end: datetime) -> int:
+    return sum(1 for (_sid, s, e) in intervals if start < e and end > s)
+
+
+def _staff_free(intervals: list[tuple], staff_id: str, start: datetime, end: datetime) -> bool:
+    return not any(sid == staff_id and start < e and end > s for (sid, s, e) in intervals)
+
+
+def available_slots_any_staff(
+    db: DB,
+    salon_id: str,
+    appt_date: date,
+    duration: int,
+    settings: dict | None = None,
+    max_slots: int = 8,
+) -> list[time]:
+    """Start-times the salon can take, given chairs + at least one free stylist.
+
+    Used by the WhatsApp flow so the customer picks a TIME first (across all
+    stylists), then a stylist — instead of hitting a dead-end per stylist.
+    """
+    settings = settings or get_settings(db, salon_id)
+    staff = get_active_staff(db, salon_id)
+    if not staff:
+        return []
+    max_concurrent = get_max_concurrent(settings, len(staff))
+    open_t = parse_time(settings["opening_time"])
+    close_t = parse_time(settings["closing_time"])
+    earliest = now_ist() + timedelta(minutes=settings["min_advance_booking_minutes"])
+
+    intervals = _salon_intervals(db, salon_id, appt_date)
+    day_end = datetime.combine(appt_date, close_t)
+    cursor = datetime.combine(appt_date, open_t)
+
+    slots: list[time] = []
+    while cursor + timedelta(minutes=duration) <= day_end and len(slots) < max_slots:
+        slot_end = cursor + timedelta(minutes=duration)
+        if cursor >= earliest and _concurrent(intervals, cursor, slot_end) < max_concurrent:
+            if any(_staff_free(intervals, s["id"], cursor, slot_end) for s in staff):
+                slots.append(cursor.time())
+        cursor += timedelta(minutes=SLOT_STEP_MINUTES)
+    return slots
+
+
+def free_staff_at(
+    db: DB,
+    salon_id: str,
+    appt_date: date,
+    appt_time: time,
+    duration: int,
+    settings: dict | None = None,
+) -> list[dict]:
+    """Active stylists with no clash at this time (empty if chairs are full)."""
+    settings = settings or get_settings(db, salon_id)
+    staff = get_active_staff(db, salon_id)
+    max_concurrent = get_max_concurrent(settings, len(staff))
+    intervals = _salon_intervals(db, salon_id, appt_date)
+    start = datetime.combine(appt_date, appt_time)
+    end = start + timedelta(minutes=duration)
+    if _concurrent(intervals, start, end) >= max_concurrent:
+        return []
+    return [s for s in staff if _staff_free(intervals, s["id"], start, end)]
+
+
 def available_slots(
     db: DB,
     salon_id: str,
@@ -138,20 +236,32 @@ def available_slots(
 
 
 def get_or_create_customer(db: DB, salon_id: str, phone: str, name: str = "Customer") -> dict:
+    # Fast path: return the existing customer without touching their name.
     resp = db.table("customers").eq("salon_id", salon_id).eq("phone", phone).execute()
     if resp["data"]:
         return resp["data"][0]
-    created = db.table("customers").insert(
+
+    # Race-safe create: relies on the UNIQUE (salon_id, phone) constraint. If a
+    # concurrent request just created this customer, the upsert ignores the
+    # conflict (returns nothing) and we re-fetch the winning row instead of
+    # raising on a duplicate-key error or creating a second row.
+    created = db.table("customers").upsert(
         {
             "salon_id": salon_id,
             "phone": phone,
             "customer_name": name,
             "opted_out_broadcasts": False,
-        }
+        },
+        on_conflict="salon_id,phone",
+        ignore_duplicates=True,
     )
-    if not created["data"]:
-        raise BookingError("Could not create customer record")
-    return created["data"][0]
+    if created["data"]:
+        return created["data"][0]
+
+    resp = db.table("customers").eq("salon_id", salon_id).eq("phone", phone).execute()
+    if resp["data"]:
+        return resp["data"][0]
+    raise BookingError("Could not create customer record")
 
 
 def validate_booking_time(appt_date: date, appt_time: time, service: dict, settings: dict) -> None:
@@ -197,6 +307,14 @@ def create_appointment(
     duration = service.get("duration_minutes", SLOT_STEP_MINUTES)
     if has_conflict(db, salon_id, staff_id, appt_date, appt_time, duration):
         raise BookingError("That slot was just taken. Please pick another time.")
+
+    # Capacity (chairs): even if this stylist is free, the room may be full.
+    staff_count = len(get_active_staff(db, salon_id))
+    max_concurrent = get_max_concurrent(settings, staff_count)
+    start = datetime.combine(appt_date, appt_time)
+    end = start + timedelta(minutes=duration)
+    if _concurrent(_salon_intervals(db, salon_id, appt_date), start, end) >= max_concurrent:
+        raise BookingError("All chairs are booked at that time. Please pick another slot.")
 
     resp = db.table("appointments").insert(
         {

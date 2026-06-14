@@ -62,4 +62,6 @@ class SalonResponse(BaseModel):
     owner_phone: str
     owner_name: str
     salon_name: str
+    upi_id: Optional[str] = None
     plan_type: str
+    api_key: Optional[str] = None  # returned on registration and /me; keep it safe

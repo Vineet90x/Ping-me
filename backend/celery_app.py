@@ -27,4 +27,8 @@ celery_app.conf.beat_schedule = {
         "task": "tasks.send_due_reminders",
         "schedule": crontab(minute="*/15"),  # every 15 minutes
     },
+    "notify-unpaid-invoices": {
+        "task": "tasks.notify_unpaid_invoices",
+        "schedule": crontab(hour=11, minute=0),  # once a day, 11:00 IST
+    },
 }
