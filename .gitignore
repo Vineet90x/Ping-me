@@ -29,3 +29,13 @@ Thumbs.db
 
 # Project specific
 r.bat
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.env.production.local
+
+# Python virtualenv
+backend/venv/
+backend/.pytest_cache/
